@@ -58,7 +58,7 @@ type Options struct {
 }
 
 //------------------------------------------------------------------------------
-func chageDirectory(path string) { 
+func changeDirectory(path string) { 
 	log.Printf("switch to %s\n", path)
 	os.Chdir(path)
 }
@@ -73,7 +73,11 @@ func checkCommandExists(command string) bool {
 func normalizePath(path string) string {
 	cmd := exec.Command("sh", "-c", "realpath " + path)
 	output, _ := cmd.Output()
-	return strings.Trim(string(output), "\r\n")
+	path = strings.Trim(string(output), "\r\n")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		log.Fatalf("path %s not exists\n", path)
+	}
+	return path
 }
 
 //------------------------------------------------------------------------------
@@ -156,7 +160,7 @@ func loadOptions(values map[string]string) (Options, error) {
 }
 
 //------------------------------------------------------------------------------
-func loadPaths(values map[string]string) ([]PathItem, error) {
+func loadPaths(values map[string]string, options Options) ([]PathItem, error) {
 	var list []PathItem
 
 	for path, value := range values {
@@ -165,7 +169,7 @@ func loadPaths(values map[string]string) ([]PathItem, error) {
 		item.pathHash = getStrHash(path)
 		item.archive = item.pathHash + ".bin"
 		item.compression = true
-		item.encryption = true
+		item.encryption = len(options.password) > 0
 
 		for _, opt := range getList(value, ",") {
 			switch opt {
@@ -246,32 +250,32 @@ func contain(list []int, value int) bool {
 
 //------------------------------------------------------------------------------
 func deleteArchive(item PathItem) {
-	log.Printf("delete archive %s\n", item.archive)
+	log.Printf("delete remote archive %s\n", item.archive)
 
-	var content = "drive delete -quiet " + item.archive;
+	var content = "drive delete -quiet " + item.archive
 	var cmd = exec.Command("sh", "-c", content)
 	if _, err := cmd.Output(); err != nil {
-		log.Printf("remote delete failed %v\n", err);		
+		log.Printf("remote delete failed %v\n", err)		
 	}
 }
 
 //------------------------------------------------------------------------------
 func restoreArchive(item PathItem, options Options) error {
-	chageDirectory(options.workingPath);
+	changeDirectory(options.workingPath)
 
 	os.Remove(item.archive)
 
 	log.Printf("download %s\n", item.archive)
-	var content = "drive pull -quiet " + item.archive;
+	var content = "drive pull -quiet " + item.archive
 	var cmd = exec.Command("sh", "-c", content)
 	if _, err := cmd.Output(); err != nil {
-		log.Printf("download archive failed %v\n", err);
+		log.Printf("download archive failed %v\n", err)
 		return err
 	}
 
-	if item.encryption && len(options.password) > 0 {
+	if item.encryption {
 		content = "gpg -d  -o- --passphrase '" + options.password +  
-		"' "  + item.archive;
+		"' "  + item.archive
 	} else {
 		content = "cat " + item.archive
 	} 
@@ -279,7 +283,7 @@ func restoreArchive(item PathItem, options Options) error {
 	content += " | tar xJ"
 	cmd = exec.Command("sh", "-c", content)
 	if output, err := cmd.Output(); err != nil {
-		log.Printf("%s %s\n", string(output), cmd.Args);		
+		log.Printf("%s %s\n", string(output), cmd.Args)
 		return err
 	}
 	os.Remove(item.archive)
@@ -288,21 +292,21 @@ func restoreArchive(item PathItem, options Options) error {
 
 //------------------------------------------------------------------------------
 func uploadArchive(item *PathItem, options Options) error {
-	chageDirectory(options.workingPath);
+	changeDirectory(options.workingPath)
 	deleteArchive(*item)
 
-	log.Printf("upload %s\n", item.archive)
+	log.Printf("upload (encryption: %t) %s\n", item.encryption, item.archive)
 	var content string
-	if item.encryption && len(options.password) > 0 {
+	if item.encryption {
 		content = "gpg -c -z 0 -o- --passphrase '" + options.password +
-		"' "  + item.archive;
+		"' "  + item.archive
 	} else {
-		content = "cat " + item.archive;
+		content = "cat " + item.archive
 	} 
-	content += " | drive push -piped " + item.archive;
+	content += " | drive push -piped " + item.archive
 	cmd := exec.Command("sh", "-c", content)
 	if output, err := cmd.Output(); err != nil {
-		log.Printf("%s %s\n", string(output), cmd.Args);		
+		log.Printf("%s %s\n", string(output), cmd.Args)
 		return err
 	}
 	os.Remove(item.archive)
@@ -324,7 +328,7 @@ func createArchive(item *PathItem, options Options) (bool, error) {
 
 	if item.compression {
 /*		buffer.WriteString(fmt.Sprintf(" - %s | 7z a -t7z -si ", filepath.Base(item.path)))
-		if item.encryption && len(options.password) > 0 {
+		if item.encryption {
 			buffer.WriteString(fmt.Sprintf(" -mhe=on -p%s ", options.password))
 		}*/
 		buffer.WriteString(fmt.Sprintf(" - %s | xz --stdout - > ", filepath.Base(item.path)))
@@ -335,32 +339,31 @@ func createArchive(item *PathItem, options Options) (bool, error) {
 	}
 
 	os.Remove(targetFile)
-	chageDirectory(filepath.Dir(item.path));	
-	log.Printf("run: %s\n", buffer.String())
+	changeDirectory(filepath.Dir(item.path))	
+	log.Printf("compress %s -> %s\n", item.path, targetFile)
 	cmd := exec.Command("sh", "-c", buffer.String())
 	if err := cmd.Run(); err != nil {
 		return false, err
 	}
 
-	log.Printf("taregt archive: %s\n", targetFile)
 	fi, _ := os.Stat(targetFile)
 	log.Printf("  size: %s\n", bytefmt.ByteSize(uint64(fi.Size())))
 	hash := getFileHash(targetFile)
-	log.Printf("  hash: %s\n", hash)
+	log.Printf("  data hash: %s\n", hash)
 	if hash == item.dataHash {
 		log.Printf("source not changed, skipping ")
 		os.Remove(targetFile)
 		return false, nil
 	}
 
-	log.Printf("hashes differ, mark to upload")
+	log.Printf("previous hash (%s) is different, mark to upload\n", item.dataHash)
 	item.dataHash = hash
 	return true, nil
 }
 
 //------------------------------------------------------------------------------
 func proccessPathItem(item *PathItem, options Options) (bool, error) {
-	log.Printf("Proccessing path %s\n", item.path)
+	log.Printf("proccessing path %s\n", item.path)
 	var need bool
 	var current = time.Now()
 
@@ -370,14 +373,16 @@ func proccessPathItem(item *PathItem, options Options) (bool, error) {
 	case Dayly:
 		need = current.YearDay() != item.date.YearDay()
 	case Weekly:
-		if current.Day() != item.date.Day() &&
-			contain(options.weeklyDays, int(current.Weekday())) {
+		if item.date.IsZero() || 
+			(current.Day() != item.date.Day() &&
+			contain(options.weeklyDays, int(current.Weekday()))) {
 			need = true
 		}
 		break
 	case Monthly:
-		if current.Day() != item.date.Day() &&
-			contain(options.monthlyDays, current.Day()) {
+		if item.date.IsZero() || 
+			(current.Day() != item.date.Day() && 
+			contain(options.monthlyDays, current.Day())) {
 			need = true
 		}
 	}
@@ -415,7 +420,7 @@ func parseCommandLine(paths []PathItem, options Options) {
 		os.Exit(0)
 	case "clear-archive":
 		log.Println("clear backup archive")
-		chageDirectory(options.workingPath);
+		changeDirectory(options.workingPath)
 		for _, item := range paths {
 			deleteArchive(item)
 		}
@@ -458,7 +463,7 @@ func main() {
 
 	checkCommands()
 
-	var configPath = filepath.Dir(os.Args[0]) + "/" + configFile;
+	var configPath = filepath.Dir(os.Args[0]) + "/" + configFile
 	log.Printf("open config file %s...\n", configPath)
 	var cfg *ini.File
 	if cfg, err = ini.Load(configPath); err != nil {
@@ -475,10 +480,10 @@ func main() {
 	log.Println("start logging")
 
 	var paths []PathItem
-	paths, err = loadPaths(cfg.Section("paths").KeysHash())
+	paths, err = loadPaths(cfg.Section("paths").KeysHash(), options)
 	loadState(options.stateFile, paths)
 
-	parseCommandLine(paths, options);
+	parseCommandLine(paths, options)
 
 	var backuped bool
 	for index, item := range paths {
