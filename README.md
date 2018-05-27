@@ -1,23 +1,25 @@
-Backup tool for linux and google drive
+Backup tool for linux and cloud storage
 =================
 
-As an owner of google account I've got 15GB of disk space in Google drive for free and it can be used perfectly to backup private program code documents etc
-The reason for writing my own backup tool was learning the go programming language and control backup process the way I prefer
+Many companies propose some cloud storage for free and it can be used perfectly to backup private data. The good review of free cloud storage is here: https://www.thebalanceeveryday.com/free-cloud-storage-1356638. This backup tool supports flexible configuration for any number of backup paths with independent scheduling, cloud binding, file / folder excluding, compression, encryption. The tool automatically tracks backup scheduling so it can be put to cron to run one a day. For now Google Drive and Yandex Disk are supported only
 
 ## Installation
-- install google drive tool https://github.com/odeke-em/drive and init some folder
+- (if needed) install google drive tool https://github.com/odeke-em/drive and init some folder
+- (if needed) install yandex disk tool: https://github.com/abbat/ydcmd and configure it
 - install gnupg from linux distributive's repository
 - clone and compile program (no external dependencies are needed):
-    go build backup.go
-- edit backup.ini file and put it along with executable
+#
+    go build .
+    
+- edit cloud-backup.ini file and put it along with executable or in the root of home folder
 - add it to /etc/crontab for every night running e.g.
     4 0  *  * * user_name /home/st/user/backup/backup
 
 ## Running
- - backup - check backup schedule and perform backup if needed
- - backup reset - reset backup state file
- - backup clear-archive - remove backup files from google drive
- - backup restore <path> - restore backup to the working directory
+ - cloud-backup - check backup schedule and perform backup if needed
+ - cloud-backup reset - reset backup state file
+ - cloud-backup clear-archive - remove backup files from google drive
+ - cloud-backup restore <path> - restore backup to the working directory
 
 ## Process
 See backup.ini comments

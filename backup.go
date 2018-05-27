@@ -20,13 +20,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"errors"
 
 	"./libs/ext-logger"
 	"./libs/github.com/go-ini/ini"
 	"./libs/github.com/cloudfoundry/bytefmt"
 )
 
-const configFile = "backup.ini"
+const configFile = "cloud-backup.ini"
 
 const (
 	Once    = iota
@@ -44,8 +45,10 @@ type PathItem struct {
 	dataHash    string
 	schedule    int
 	date        time.Time
-	archive     string
+	archive     string		// base name
+	archiveSize int64
 	upload      bool
+	cloud 		Cloud
 }
 
 type Options struct {
@@ -55,6 +58,10 @@ type Options struct {
 	password    string
 	weeklyDays  []int
 	monthlyDays []int
+	cloudName	string
+	cloudPath	string
+	level		int
+	verbose		bool
 }
 
 //------------------------------------------------------------------------------
@@ -78,6 +85,13 @@ func normalizePath(path string) string {
 		log.Fatalf("path %s not exists\n", path)
 	}
 	return path
+}
+
+//------------------------------------------------------------------------------
+func normalizePathNoCheck(path string) string {
+	cmd := exec.Command("sh", "-c", "realpath " + path)
+	output, _ := cmd.Output()
+	return strings.Trim(string(output), "\r\n")
 }
 
 //------------------------------------------------------------------------------
@@ -137,8 +151,8 @@ func loadOptions(values map[string]string) (Options, error) {
 	var options Options
 	var err error
 
-	options.logFile = normalizePath(values["log-file"])
-	options.stateFile = normalizePath(values["state-file"])
+	options.logFile = normalizePathNoCheck(values["log-file"])
+	options.stateFile = normalizePathNoCheck(values["state-file"])
 	options.workingPath = normalizePath(values["working-dir"])
 
 	if len(options.workingPath) == 0 {
@@ -156,6 +170,20 @@ func loadOptions(values map[string]string) (Options, error) {
 	}
 	days = getList(values["weekly"], ",")
 	options.weeklyDays, err = readDays(days)
+
+	options.level = 2
+	if len(values["compression-level"]) > 0 {
+		options.level,_ = strconv.Atoi(values["compression-level"])
+		if options.level < 0 || options.level > 9 {
+			log.Fatalln("bad compression level value")
+		}
+	}
+	
+	options.cloudName = values["cloud"]
+	options.cloudPath = values["cloud-dir"]
+	if len(options.cloudPath) != 0 && options.cloudPath[len(options.cloudPath) - 1] != '/' {
+		options.cloudPath += "/";
+	}
 	return options, err
 }
 
@@ -190,7 +218,15 @@ func loadPaths(values map[string]string, options Options) ([]PathItem, error) {
 					item.exclude = getList(opt[len("exclude:"):], ":")
 					break
 				}
-				log.Fatalf("unknown path %s option %s\n", path, opt)
+				if item.cloud = getCloudByName(opt); item.cloud == nil {
+					log.Fatalf("unknown option %s, path %s \n", opt, path)
+				}
+			}
+		}
+		
+		if item.cloud == nil {
+			if item.cloud = getCloudByName(options.cloudName); item.cloud == nil {
+				log.Fatalf("cloud name for path %s not specified\n", path);
 			}
 		}
 		list = append(list, item)
@@ -201,21 +237,23 @@ func loadPaths(values map[string]string, options Options) ([]PathItem, error) {
 //------------------------------------------------------------------------------
 func loadState(fileName string, items []PathItem) error {
 	// state file format
-	// path:md5(path):md5(data):last backup date
+	// path:md5(path):md5(data):last backup date:archive size
 	file, err := os.Open(fileName)
 	if err != nil {
 		return nil
 	}
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		list := strings.Split(scanner.Text(), ",")
-		if len(list) < 4 {
+		if len(list) < 5 {
 			return nil
 		}
 		for index := range items {
 			if items[index].pathHash == list[1] {
 				items[index].dataHash = list[2]
 				items[index].date.UnmarshalText([]byte(list[3]))
+				items[index].archiveSize, _ = strconv.ParseInt(list[4], 10, 64)
 				break
 			}
 		}
@@ -232,10 +270,26 @@ func saveState(fileName string, items []PathItem) error {
 	}
 	for _, item := range items {
 		date, _ := item.date.MarshalText()
-		fmt.Fprintf(file, "%s,%s,%s,%s\n", item.path, item.pathHash, item.dataHash, string(date))
+		fmt.Fprintf(file, "%s,%s,%s,%s,%d\n", 
+			item.path, item.pathHash, item.dataHash, string(date), item.archiveSize)
 	}
 	file.Close()
 	return nil
+}
+
+//------------------------------------------------------------------------------
+func getTotalBackupSize(items []PathItem) {
+	var totalSize uint64
+	var cloudSize = make(map[string]uint64);
+	for index := range items {
+		var size = uint64(items[index].archiveSize)
+		totalSize += size
+		cloudSize[items[index].cloud.name()] += size 
+	}
+	log.Printf("Total backup size for now: %s\n", bytefmt.ByteSize(totalSize))
+	for name,size := range cloudSize {
+		log.Printf("  %s size: %s\n", name, bytefmt.ByteSize(size))
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -249,30 +303,35 @@ func contain(list []int, value int) bool {
 }
 
 //------------------------------------------------------------------------------
-func deleteArchive(item PathItem) {
+func logCommandOuput(output []byte) {
+	str := strings.Replace(string(output), "\n", "|", -1)
+	log.Printf("command output: %s\n", str)		
+}
+
+//------------------------------------------------------------------------------
+func deleteArchive(item PathItem, options Options) {
 	log.Printf("delete remote archive %s\n", item.archive)
 
-	var content = "drive delete -quiet " + item.archive
-	var cmd = exec.Command("sh", "-c", content)
-	if _, err := cmd.Output(); err != nil {
+	if output, err := item.cloud.remove(options.cloudPath + item.archive); err != nil {
+		logCommandOuput(output)
 		log.Printf("remote delete failed %v\n", err)		
 	}
 }
 
 //------------------------------------------------------------------------------
 func restoreArchive(item PathItem, options Options) error {
-	changeDirectory(options.workingPath)
 
+	changeDirectory(options.workingPath)
 	os.Remove(item.archive)
 
 	log.Printf("download %s\n", item.archive)
-	var content = "drive pull -quiet " + item.archive
-	var cmd = exec.Command("sh", "-c", content)
-	if _, err := cmd.Output(); err != nil {
+	if output,err := item.cloud.download(options.cloudPath + item.archive); err != nil {
+		logCommandOuput(output)
 		log.Printf("download archive failed %v\n", err)
 		return err
 	}
-
+	
+	var content string
 	if item.encryption {
 		content = "gpg -d  -o- --passphrase '" + options.password +  
 		"' "  + item.archive
@@ -281,9 +340,8 @@ func restoreArchive(item PathItem, options Options) error {
 	} 
 
 	content += " | tar xJ"
-	cmd = exec.Command("sh", "-c", content)
-	if output, err := cmd.Output(); err != nil {
-		log.Printf("%s %s\n", string(output), cmd.Args)
+	cmd := exec.Command("sh", "-c", content)
+	if _, err := cmd.Output(); err != nil {
 		return err
 	}
 	os.Remove(item.archive)
@@ -293,20 +351,14 @@ func restoreArchive(item PathItem, options Options) error {
 //------------------------------------------------------------------------------
 func uploadArchive(item *PathItem, options Options) error {
 	changeDirectory(options.workingPath)
-	deleteArchive(*item)
+	deleteArchive(*item, options)
 
-	log.Printf("upload (encryption: %t) %s\n", item.encryption, item.archive)
-	var content string
-	if item.encryption {
-		content = "gpg -c -z 0 -o- --passphrase '" + options.password +
-		"' "  + item.archive
-	} else {
-		content = "cat " + item.archive
-	} 
-	content += " | drive push -piped " + item.archive
-	cmd := exec.Command("sh", "-c", content)
-	if output, err := cmd.Output(); err != nil {
-		log.Printf("%s %s\n", string(output), cmd.Args)
+	log.Printf("upload %s\n", item.archive)
+	log.Printf("  encryption: %v\n", item.encryption)
+	log.Printf("  cloud: %s\n", item.cloud.name())
+	
+	if output,err := item.cloud.upload(item.archive, options.cloudPath); err != nil {
+		logCommandOuput(output)
 		return err
 	}
 	os.Remove(item.archive)
@@ -324,38 +376,64 @@ func createArchive(item *PathItem, options Options) (bool, error) {
 		buffer.WriteString(s)
 	}
 	buffer.WriteString(" --mtime=0")
-	buffer.WriteString(" -cf")
-
-	if item.compression {
-/*		buffer.WriteString(fmt.Sprintf(" - %s | 7z a -t7z -si ", filepath.Base(item.path)))
+	buffer.WriteString(" -cf - ")
+	buffer.WriteString(filepath.Base(item.path))
+	buffer.WriteString(" | tee >")
+	if item.compression || item.encryption  {
+		buffer.WriteString("(")
+		if item.compression {
+			buffer.WriteString("xz --stdout -")
+			buffer.WriteString(strconv.Itoa(options.level))
+			if item.encryption  {
+				buffer.WriteString(" - | ")
+			} else {
+				buffer.WriteString(" > ")
+				buffer.WriteString(targetFile)
+			}
+		}
 		if item.encryption {
-			buffer.WriteString(fmt.Sprintf(" -mhe=on -p%s ", options.password))
-		}*/
-		buffer.WriteString(fmt.Sprintf(" - %s | xz --stdout - > ", filepath.Base(item.path)))
-		buffer.WriteString(targetFile)
-
+			buffer.WriteString("gpg -z 0 -o ")
+			buffer.WriteString(targetFile)
+			buffer.WriteString(" --passphrase ")
+			buffer.WriteString(options.password)
+			buffer.WriteString(" -c - ")
+		}
+		buffer.WriteString(")")
 	} else {
-		buffer.WriteString(fmt.Sprintf(" %s %s", targetFile, filepath.Base(item.path)))
+		buffer.WriteString(targetFile)
 	}
-
+	buffer.WriteString(" | md5sum")
+	//tar --mtime=0 -cf - 'input' | tee >(xz --stdout - | gpg -z 0 -o 'output' --passphrase 'password' -c -) | md5sum
+	
 	os.Remove(targetFile)
 	changeDirectory(filepath.Dir(item.path))	
-	log.Printf("compress %s -> %s\n", item.path, targetFile)
-	cmd := exec.Command("sh", "-c", buffer.String())
-	if err := cmd.Run(); err != nil {
+
+	log.Printf("archive %s -> %s\n", item.path, targetFile)
+	if options.verbose {
+		log.Printf("command: %s\n", buffer.String())	
+	}
+
+	var output []byte	
+	var err error
+	cmd := exec.Command("bash", "-c", buffer.String())
+	if output,err = cmd.CombinedOutput(); err != nil {
 		return false, err
 	}
 
+	if len(output) < 32 {
+		return false, errors.New("calculate md5 sum failed")
+	}
+	var hash = string(output[0:32]);
+
 	fi, _ := os.Stat(targetFile)
+	item.archiveSize = fi.Size()
 	log.Printf("  size: %s\n", bytefmt.ByteSize(uint64(fi.Size())))
-	hash := getFileHash(targetFile)
 	log.Printf("  data hash: %s\n", hash)
 	if hash == item.dataHash {
 		log.Printf("source not changed, skipping ")
 		os.Remove(targetFile)
 		return false, nil
 	}
-
 	log.Printf("previous hash (%s) is different, mark to upload\n", item.dataHash)
 	item.dataHash = hash
 	return true, nil
@@ -422,7 +500,7 @@ func parseCommandLine(paths []PathItem, options Options) {
 		log.Println("clear backup archive")
 		changeDirectory(options.workingPath)
 		for _, item := range paths {
-			deleteArchive(item)
+			deleteArchive(item, options)
 		}
 		os.Exit(0)
 	case "restore": 
@@ -445,9 +523,22 @@ func parseCommandLine(paths []PathItem, options Options) {
 }
 
 //------------------------------------------------------------------------------
-func checkCommands() {
-	var commands = []string{ "drive", "gpg", "xz", "tar" }
-	for _, item := range commands {
+func checkCommands(paths []PathItem, options Options) {
+	var commands = make(map[string]bool);
+	commands["bash"] = true
+	commands["tar"] = true
+	commands["md5sum"] = true
+	
+	for _,item := range paths {
+		if item.encryption {
+			commands["gpg"] = true
+		}
+		if item.compression {
+			commands["xz"] = true
+		}
+		commands[item.cloud.command()] = true
+	}
+	for item,_ := range commands {
 		if !checkCommandExists(item) {
 			log.Fatalf("required command %s not found\n", item)		
 		}
@@ -461,9 +552,10 @@ func main() {
 	log.SetOutput(&logger)
 	defer logger.Close()
 
-	checkCommands()
-
 	var configPath = filepath.Dir(os.Args[0]) + "/" + configFile
+	if _, err := os.Stat(configPath); err != nil {	
+		configPath = normalizePathNoCheck("~/" + configFile)
+	}
 	log.Printf("open config file %s...\n", configPath)
 	var cfg *ini.File
 	if cfg, err = ini.Load(configPath); err != nil {
@@ -474,6 +566,7 @@ func main() {
 	if options, err = loadOptions(cfg.Section("config").KeysHash()); err != nil {
 		log.Fatalf("failed to read options: %v", err)
 	}
+	options.verbose = false
 
 	logger.SetFile(options.logFile)
 	log.Println("")
@@ -483,6 +576,7 @@ func main() {
 	paths, err = loadPaths(cfg.Section("paths").KeysHash(), options)
 	loadState(options.stateFile, paths)
 
+	checkCommands(paths, options)
 	parseCommandLine(paths, options)
 
 	var backuped bool
@@ -499,6 +593,7 @@ func main() {
 			}
 		}
 	}
+	getTotalBackupSize(paths);
 	log.Println("done")
 }
 
