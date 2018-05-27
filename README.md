@@ -8,12 +8,12 @@ Many companies propose some cloud storage for free and it can be used perfectly 
 - (if needed) install yandex disk tool: https://github.com/abbat/ydcmd and configure it
 - install gnupg from linux distributive's repository
 - clone and compile program (no external dependencies are needed):
-#
+
     go build .
     
-- edit cloud-backup.ini file and put it along with executable or in the root of home folder
+- edit cloud-backup.ini file (see comments inside) and put it along with executable or in the root of home folder
 - add it to /etc/crontab for every night running e.g.
-    4 0  *  * * user_name /home/st/user/backup/backup
+    4 0  *  * * user_name /home/st/user/backup/cloud-backup
 
 ## Running
  - cloud-backup - check backup schedule and perform backup if needed
@@ -22,10 +22,8 @@ Many companies propose some cloud storage for free and it can be used perfectly 
  - cloud-backup restore <path> - restore backup to the working directory
 
 ## Process
-See backup.ini comments
-When program is executed it loads state file. State file contains hash and date of last backup for every backup path.
-Then it checks every path's backup period. If it is time that data at the path is compressed, compressed data's hash is compared to the hash from previous backup; if hashes don't match 
-compressed data is encrypted and pushed to google drive
+When program is executed it loads state file. State file contains data hash and date of last backup for every backup path.
+Then it checks every path's backup period. If it is time that data at the path is compressed, compressed data's hash is compared to the hash from previous backup; if hashes don't match compressed data is encrypted and pushed to cloud
 
 ## License
 
